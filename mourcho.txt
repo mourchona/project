@@ -1,0 +1,1040 @@
+﻿/**
+ * ============================================================
+ * MEMBER 4: FINANCIALS & LEDGER
+ * FEATURE 08: ADVANCE / PARTIAL PAYMENTS
+ * ============================================================
+ *
+ * Features:
+ * 1. Advance payment
+ * 2. Partial payment
+ * 3. Final payment
+ * 4. Multiple payments per order
+ * 5. Outstanding balance calculation
+ * 6. Customer spending calculation
+ * 7. Refund adjustment
+ * 8. Payment validation
+ * 9. Duplicate payment prevention
+ * 10. User activity logging
+ * 11. Automated functional tests
+ *
+ * Requirements: Node.js (no external packages)
+ * Run: node feature08.js
+ */
+
+
+// ============================================================
+// 1. MONEY VALIDATION UTILITIES
+// ============================================================
+
+
+function toCents(amount, fieldName = "Amount", allowZero = false) {
+  const value = Number(amount);
+
+
+  if (!Number.isFinite(value)) {
+    throw new Error(`${fieldName} must be a valid finite number.`);
+  }
+
+
+  if (value < 0 || (!allowZero && value <= 0)) {
+    throw new Error(
+      allowZero
+        ? `${fieldName} cannot be negative.`
+        : `${fieldName} must be greater than 0.`
+    );
+  }
+
+
+  return Math.round((value + Number.EPSILON) * 100);
+}
+
+
+function fromCents(cents) {
+  return Number((cents / 100).toFixed(2));
+}
+
+
+// ============================================================
+// 2. USER CLASS
+// ============================================================
+
+
+class User {
+  constructor({
+    id,
+    name,
+    email,
+    password,
+    role,
+    is_active = true
+  }) {
+    if (id === undefined || id === null) {
+      throw new Error("User ID is required.");
+    }
+
+
+    if (!name || !email || !password || !role) {
+      throw new Error("User details are incomplete.");
+    }
+
+
+    this.id = id;
+    this.name = name;
+    this.email = email;
+    this.password = password;
+    this.role = role;
+    this.is_active = is_active;
+    this.activityLog = [];
+  }
+
+
+  hasRole(role) {
+    return this.role === role;
+  }
+
+
+  logActivity(action) {
+    this.activityLog.push({
+      action,
+      timestamp: new Date()
+    });
+  }
+}
+
+
+// ============================================================
+// 3. CUSTOMER CLASS
+// ============================================================
+
+
+class Customer {
+  constructor({
+    id,
+    name,
+    phone,
+    email,
+    default_address,
+    dietary_notes = "",
+    loyalty_points = 0
+  }) {
+    if (id === undefined || id === null) {
+      throw new Error("Customer ID is required.");
+    }
+
+
+    this.id = id;
+    this.name = name;
+    this.phone = phone;
+    this.email = email;
+    this.default_address = default_address;
+    this.dietary_notes = dietary_notes;
+    this.loyalty_points = loyalty_points;
+
+
+    // One customer can have multiple orders.
+    this.orders = [];
+  }
+
+
+  addOrder(order) {
+    if (!(order instanceof Order)) {
+      throw new Error("Invalid order object.");
+    }
+
+
+    if (order.customer_id !== this.id) {
+      throw new Error("Order does not belong to this customer.");
+    }
+
+
+    if (this.orders.some(o => o.id === order.id)) {
+      throw new Error("Duplicate order ID.");
+    }
+
+
+    this.orders.push(order);
+  }
+
+
+  // Total net payments received across all customer orders.
+  getTotalSpent() {
+    const total = this.orders.reduce(
+      (sum, order) => sum + order.getTotalPaidCents(),
+      0
+    );
+
+
+    return fromCents(total);
+  }
+
+
+  // Total outstanding balance across all customer orders.
+  getOutstandingBalance() {
+    const total = this.orders.reduce(
+      (sum, order) => sum + order.getRemainingBalanceCents(),
+      0
+    );
+
+
+    return fromCents(total);
+  }
+}
+
+
+// ============================================================
+// 4. PAYMENT CLASS
+// ============================================================
+
+
+class Payment {
+  constructor({
+    id,
+    order_id,
+    recorded_by,
+    amount,
+    payment_method,
+    payment_type,
+    transaction_ref = null,
+    paid_at = new Date()
+  }) {
+    if (id === undefined || id === null) {
+      throw new Error("Payment ID is required.");
+    }
+
+
+    if (!payment_method || !payment_type) {
+      throw new Error("Payment method and type are required.");
+    }
+
+
+    this.id = id;
+    this.order_id = order_id;
+    this.recorded_by = recorded_by;
+    this.amount = fromCents(toCents(amount));
+    this.payment_method = payment_method;
+    this.payment_type = payment_type;
+    this.transaction_ref = transaction_ref;
+    this.paid_at = paid_at;
+  }
+}
+
+
+// ============================================================
+// 5. REFUND ADJUSTMENT CLASS
+// ============================================================
+
+
+class RefundAdjustment {
+  constructor({
+    id,
+    order_id,
+    approved_by,
+    amount,
+    adjustment_type,
+    reason,
+    processed_at = new Date()
+  }) {
+    if (id === undefined || id === null) {
+      throw new Error("Adjustment ID is required.");
+    }
+
+
+    if (approved_by === undefined || approved_by === null) {
+      throw new Error("Approver ID is required.");
+    }
+
+
+    if (!adjustment_type || !reason) {
+      throw new Error("Adjustment type and reason are required.");
+    }
+
+
+    this.id = id;
+    this.order_id = order_id;
+    this.approved_by = approved_by;
+    this.amount = fromCents(toCents(amount));
+    this.adjustment_type = adjustment_type;
+    this.reason = reason;
+    this.processed_at = processed_at;
+  }
+}
+
+
+// ============================================================
+// 6. ORDER CLASS
+// ============================================================
+
+
+class Order {
+  constructor({
+    id,
+    order_number,
+    customer_id,
+    created_by,
+    order_type,
+    scheduled_for,
+    status = "PENDING",
+    subtotal = 0,
+    discount_amount = 0,
+    delivery_fee = 0,
+    total_amount = 0,
+    internal_notes = "",
+    cancellation_reason = null
+  }) {
+    if (id === undefined || id === null) {
+      throw new Error("Order ID is required.");
+    }
+
+
+    this.id = id;
+    this.order_number = order_number;
+    this.customer_id = customer_id;
+    this.created_by = created_by;
+    this.order_type = order_type;
+    this.scheduled_for = scheduled_for;
+    this.status = status;
+
+
+    this.subtotal = fromCents(
+      toCents(subtotal, "Subtotal", true)
+    );
+
+
+    this.discount_amount = fromCents(
+      toCents(discount_amount, "Discount", true)
+    );
+
+
+    this.delivery_fee = fromCents(
+      toCents(delivery_fee, "Delivery fee", true)
+    );
+
+
+    this.total_amount = fromCents(
+      toCents(total_amount, "Total amount", true)
+    );
+
+
+    this.internal_notes = internal_notes;
+    this.cancellation_reason = cancellation_reason;
+
+
+    // One order can have multiple payments and adjustments.
+    this.payments = [];
+    this.refundAdjustments = [];
+  }
+
+
+  // ----------------------------------------------------------
+  // Calculate final order amount.
+  // Total = Subtotal - Discount + Delivery Fee
+  // ----------------------------------------------------------
+
+
+  calculateTotals() {
+    const subtotal = toCents(this.subtotal, "Subtotal", true);
+    const discount = toCents(
+      this.discount_amount,
+      "Discount",
+      true
+    );
+    const delivery = toCents(
+      this.delivery_fee,
+      "Delivery fee",
+      true
+    );
+
+
+    if (discount > subtotal) {
+      throw new Error("Discount cannot exceed subtotal.");
+    }
+
+
+    this.total_amount = fromCents(
+      subtotal - discount + delivery
+    );
+
+
+    return this.total_amount;
+  }
+
+
+  // ----------------------------------------------------------
+  // Internal calculation: gross payments in cents.
+  // ----------------------------------------------------------
+
+
+  getGrossPaidCents() {
+    return this.payments.reduce(
+      (sum, payment) => sum + toCents(payment.amount),
+      0
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // Internal calculation: refunds in cents.
+  // ----------------------------------------------------------
+
+
+  getRefundedCents() {
+    return this.refundAdjustments.reduce(
+      (sum, adjustment) => sum + toCents(adjustment.amount),
+      0
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // FEATURE 08: ADD ADVANCE / PARTIAL / FINAL PAYMENT
+  // ----------------------------------------------------------
+
+
+  addPayment({
+    id,
+    user,
+    amount,
+    payment_method,
+    payment_type,
+    transaction_ref = null
+  }) {
+    // Validate staff user.
+    if (!(user instanceof User)) {
+      throw new Error("A valid User object is required.");
+    }
+
+
+    if (!user.is_active) {
+      throw new Error("Inactive users cannot record payments.");
+    }
+
+
+    if (id === undefined || id === null) {
+      throw new Error("Payment ID is required.");
+    }
+
+
+    // Prevent duplicate payment IDs within this order.
+    if (this.payments.some(payment => payment.id === id)) {
+      throw new Error("Duplicate payment ID.");
+    }
+
+
+    if (!payment_method || typeof payment_method !== "string") {
+      throw new Error("Valid payment method is required.");
+    }
+
+
+    const paymentCents = toCents(amount, "Payment amount");
+    const remainingCents = this.getRemainingBalanceCents();
+
+
+    if (remainingCents <= 0) {
+      throw new Error("This order is already fully paid.");
+    }
+
+
+    // Prevent overpayment.
+    if (paymentCents > remainingCents) {
+      throw new Error(
+        `Payment (${fromCents(paymentCents)}) exceeds ` +
+        `remaining due (${fromCents(remainingCents)}).`
+      );
+    }
+
+
+    // Automatically determine payment type.
+    let resolvedType;
+
+
+    if (paymentCents === remainingCents) {
+      resolvedType = "FINAL";
+    } else if (this.payments.length === 0) {
+      resolvedType = "ADVANCE";
+    } else {
+      resolvedType = "PARTIAL";
+    }
+
+
+    // If an explicit type is provided, it must match.
+    if (
+      payment_type !== undefined &&
+      payment_type !== null &&
+      payment_type !== resolvedType
+    ) {
+      throw new Error(
+        `Invalid payment type. Expected ${resolvedType}.`
+      );
+    }
+
+
+    const payment = new Payment({
+      id,
+      order_id: this.id,
+      recorded_by: user.id,
+      amount: fromCents(paymentCents),
+      payment_method,
+      payment_type: resolvedType,
+      transaction_ref,
+      paid_at: new Date()
+    });
+
+
+    // Save payment.
+    this.payments.push(payment);
+
+
+    // Record user activity.
+    user.logActivity(
+      `Recorded ${resolvedType} payment of ` +
+      `${fromCents(paymentCents)} for ${this.order_number}`
+    );
+
+
+    return payment;
+  }
+
+
+  // ----------------------------------------------------------
+  // FEATURE 08: REFUND / ADJUSTMENT RECORDING
+  // ----------------------------------------------------------
+
+
+  addRefundAdjustment({
+    id,
+    approved_by,
+    amount,
+    adjustment_type,
+    reason
+  }) {
+    if (approved_by === undefined || approved_by === null) {
+      throw new Error("Approver ID is required.");
+    }
+
+
+    if (id === undefined || id === null) {
+      throw new Error("Adjustment ID is required.");
+    }
+
+
+    if (
+      this.refundAdjustments.some(
+        adjustment => adjustment.id === id
+      )
+    ) {
+      throw new Error("Duplicate adjustment ID.");
+    }
+
+
+    const refundCents = toCents(amount, "Refund amount");
+
+
+    const netPaidCents =
+      this.getGrossPaidCents() - this.getRefundedCents();
+
+
+    if (refundCents > netPaidCents) {
+      throw new Error(
+        "Refund cannot exceed the net amount already paid."
+      );
+    }
+
+
+    const adjustment = new RefundAdjustment({
+      id,
+      order_id: this.id,
+      approved_by,
+      amount: fromCents(refundCents),
+      adjustment_type,
+      reason,
+      processed_at: new Date()
+    });
+
+
+    this.refundAdjustments.push(adjustment);
+
+
+    return adjustment;
+  }
+
+
+  // ----------------------------------------------------------
+  // GET TOTAL NET PAID
+  // Gross payments - refunds
+  // ----------------------------------------------------------
+
+
+  getTotalPaidCents() {
+    return Math.max(
+      0,
+      this.getGrossPaidCents() - this.getRefundedCents()
+    );
+  }
+
+
+  getTotalPaid() {
+    return fromCents(this.getTotalPaidCents());
+  }
+
+
+  // ----------------------------------------------------------
+  // GET REMAINING BALANCE
+  // Order total - net paid
+  // ----------------------------------------------------------
+
+
+  getRemainingBalanceCents() {
+    const total = toCents(
+      this.total_amount,
+      "Order total",
+      true
+    );
+
+
+    return Math.max(0, total - this.getTotalPaidCents());
+  }
+
+
+  getRemainingBalance() {
+    return fromCents(this.getRemainingBalanceCents());
+  }
+
+
+  // ----------------------------------------------------------
+  // GET PAYMENT HISTORY
+  // ----------------------------------------------------------
+
+
+  getPaymentHistory() {
+    return this.payments.map(payment => ({
+      payment_id: payment.id,
+      order_id: payment.order_id,
+      amount: payment.amount,
+      payment_method: payment.payment_method,
+      payment_type: payment.payment_type,
+      transaction_ref: payment.transaction_ref,
+      recorded_by: payment.recorded_by,
+      paid_at: payment.paid_at
+    }));
+  }
+}
+
+
+// ============================================================
+// 7. AUTOMATED FUNCTIONAL TESTING
+// ============================================================
+
+
+const assert = require("node:assert/strict");
+
+
+let passed = 0;
+let failed = 0;
+
+
+function test(name, callback) {
+  try {
+    callback();
+    passed++;
+    console.log(`PASS: ${name}`);
+  } catch (error) {
+    failed++;
+    console.error(`FAIL: ${name}`);
+    console.error(`Reason: ${error.message}`);
+  }
+}
+
+
+function expectError(callback, expectedMessage) {
+  assert.throws(callback, new RegExp(expectedMessage));
+}
+
+
+// ============================================================
+// 8. TEST DATA
+// ============================================================
+
+
+const staffUser = new User({
+  id: 1,
+  name: "Ayesha",
+  email: "ayesha@bakery.com",
+  password: "hashed_pw",
+  role: "CASHIER"
+});
+
+
+const customer = new Customer({
+  id: 10,
+  name: "Rahim",
+  phone: "01700000000",
+  email: "rahim@example.com",
+  default_address: "Dhanmondi, Dhaka"
+});
+
+
+// ============================================================
+// 9. TEST 1: CREATE ORDER AND CALCULATE TOTAL
+// ============================================================
+
+
+const order = new Order({
+  id: 501,
+  order_number: "ORD-1001",
+  customer_id: customer.id,
+  created_by: staffUser.id,
+  order_type: "DELIVERY",
+  scheduled_for: new Date("2026-11-20T16:00:00"),
+  subtotal: 3000,
+  discount_amount: 200,
+  delivery_fee: 100
+});
+
+
+test("Calculate order total correctly", () => {
+  assert.equal(order.calculateTotals(), 2900);
+  assert.equal(order.total_amount, 2900);
+});
+
+
+customer.addOrder(order);
+
+
+// ============================================================
+// 10. TEST 2: ADVANCE PAYMENT
+// ============================================================
+
+
+const p1 = order.addPayment({
+  id: 1,
+  user: staffUser,
+  amount: 1000,
+  payment_method: "BKASH",
+  transaction_ref: "TRX88412"
+});
+
+
+test("Record advance payment", () => {
+  assert.equal(p1.payment_type, "ADVANCE");
+  assert.equal(p1.amount, 1000);
+  assert.equal(order.getTotalPaid(), 1000);
+  assert.equal(order.getRemainingBalance(), 1900);
+});
+
+
+// ============================================================
+// 11. TEST 3: FINAL PAYMENT
+// ============================================================
+
+
+const p2 = order.addPayment({
+  id: 2,
+  user: staffUser,
+  amount: 1900,
+  payment_method: "CASH"
+});
+
+
+test("Record final payment", () => {
+  assert.equal(p2.payment_type, "FINAL");
+  assert.equal(order.getTotalPaid(), 2900);
+  assert.equal(order.getRemainingBalance(), 0);
+});
+
+
+// ============================================================
+// 12. TEST 4: MULTIPLE PARTIAL PAYMENTS
+// ============================================================
+
+
+const order2 = new Order({
+  id: 502,
+  order_number: "ORD-1002",
+  customer_id: customer.id,
+  created_by: staffUser.id,
+  order_type: "PICKUP",
+  scheduled_for: new Date(),
+  subtotal: 5000
+});
+
+
+order2.calculateTotals();
+customer.addOrder(order2);
+
+
+const p3 = order2.addPayment({
+  id: 3,
+  user: staffUser,
+  amount: 1000,
+  payment_method: "CASH"
+});
+
+
+const p4 = order2.addPayment({
+  id: 4,
+  user: staffUser,
+  amount: 1500,
+  payment_method: "BKASH"
+});
+
+
+const p5 = order2.addPayment({
+  id: 5,
+  user: staffUser,
+  amount: 1000,
+  payment_method: "CASH"
+});
+
+
+test("Record multiple partial payments", () => {
+  assert.equal(p3.payment_type, "ADVANCE");
+  assert.equal(p4.payment_type, "PARTIAL");
+  assert.equal(p5.payment_type, "PARTIAL");
+
+
+  assert.equal(order2.getTotalPaid(), 3500);
+  assert.equal(order2.getRemainingBalance(), 1500);
+});
+
+
+// ============================================================
+// 13. TEST 5: OVERPAYMENT VALIDATION
+// ============================================================
+
+
+test("Reject overpayment", () => {
+  expectError(() => {
+    order2.addPayment({
+      id: 6,
+      user: staffUser,
+      amount: 2000,
+      payment_method: "CASH"
+    });
+  }, "exceeds remaining due");
+
+
+  assert.equal(order2.getTotalPaid(), 3500);
+});
+
+
+// ============================================================
+// 14. TEST 6: ZERO PAYMENT VALIDATION
+// ============================================================
+
+
+test("Reject zero payment", () => {
+  expectError(() => {
+    order2.addPayment({
+      id: 7,
+      user: staffUser,
+      amount: 0,
+      payment_method: "CASH"
+    });
+  }, "greater than 0");
+});
+
+
+// ============================================================
+// 15. TEST 7: NEGATIVE PAYMENT VALIDATION
+// ============================================================
+
+
+test("Reject negative payment", () => {
+  expectError(() => {
+    order2.addPayment({
+      id: 8,
+      user: staffUser,
+      amount: -100,
+      payment_method: "CASH"
+    });
+  }, "greater than 0");
+});
+
+
+// ============================================================
+// 16. TEST 8: INVALID PAYMENT AMOUNT
+// ============================================================
+
+
+test("Reject NaN and Infinity payments", () => {
+  for (const invalidAmount of [NaN, Infinity, -Infinity]) {
+    expectError(() => {
+      order2.addPayment({
+        id: `INVALID-${String(invalidAmount)}`,
+        user: staffUser,
+        amount: invalidAmount,
+        payment_method: "CASH"
+      });
+    }, "finite number");
+  }
+});
+
+
+// ============================================================
+// 17. TEST 9: DUPLICATE PAYMENT ID
+// ============================================================
+
+
+test("Reject duplicate payment ID", () => {
+  expectError(() => {
+    order2.addPayment({
+      id: 3,
+      user: staffUser,
+      amount: 100,
+      payment_method: "CASH"
+    });
+  }, "Duplicate payment ID");
+});
+
+
+// ============================================================
+// 18. TEST 10: INVALID PAYMENT TYPE
+// ============================================================
+
+
+test("Reject incorrect explicit payment type", () => {
+  expectError(() => {
+    order2.addPayment({
+      id: 9,
+      user: staffUser,
+      amount: 100,
+      payment_method: "CASH",
+      payment_type: "FINAL"
+    });
+  }, "Invalid payment type");
+});
+
+
+// ============================================================
+// 19. TEST 11: INACTIVE USER VALIDATION
+// ============================================================
+
+
+const inactiveUser = new User({
+  id: 2,
+  name: "Inactive Staff",
+  email: "inactive@bakery.com",
+  password: "hashed_pw",
+  role: "CASHIER",
+  is_active: false
+});
+
+
+test("Reject payments from inactive users", () => {
+  expectError(() => {
+    order2.addPayment({
+      id: 10,
+      user: inactiveUser,
+      amount: 100,
+      payment_method: "CASH"
+    });
+  }, "Inactive users");
+});
+
+
+// ============================================================
+// 20. TEST 12: REFUND ADJUSTMENT
+// ============================================================
+
+
+const refund = order.addRefundAdjustment({
+  id: 1,
+  approved_by: staffUser.id,
+  amount: 500,
+  adjustment_type: "REFUND",
+  reason: "Customer refund request"
+});
+
+
+test("Record refund adjustment", () => {
+  assert.equal(refund.amount, 500);
+  assert.equal(order.getTotalPaid(), 2400);
+  assert.equal(order.getRemainingBalance(), 500);
+});
+
+
+// ============================================================
+// 21. TEST 13: EXCESSIVE REFUND VALIDATION
+// ============================================================
+
+
+test("Reject refund exceeding net paid amount", () => {
+  expectError(() => {
+    order.addRefundAdjustment({
+      id: 2,
+      approved_by: staffUser.id,
+      amount: 2500,
+      adjustment_type: "REFUND",
+      reason: "Invalid refund"
+    });
+  }, "cannot exceed");
+});
+
+
+// ============================================================
+// 22. TEST 14: CUSTOMER FINANCIAL SUMMARY
+// ============================================================
+
+
+test("Calculate customer total spending", () => {
+  assert.equal(customer.getTotalSpent(), 5900);
+});
+
+
+test("Calculate customer outstanding balance", () => {
+  assert.equal(customer.getOutstandingBalance(), 2000);
+});
+
+
+// ============================================================
+// 23. TEST 15: USER ACTIVITY LOG
+// ============================================================
+
+
+test("Record payment activities", () => {
+  assert.equal(staffUser.activityLog.length, 5);
+});
+
+
+// ============================================================
+// 24. DISPLAY PAYMENT HISTORY
+// ============================================================
+
+
+console.log("\n========================================");
+console.log("         PAYMENT HISTORY");
+console.log("========================================");
+
+
+console.table(order.getPaymentHistory());
+
+
+console.log("\n========================================");
+console.log("       CUSTOMER FINANCIAL SUMMARY");
+console.log("========================================");
+
+
+console.log("Customer Name:", customer.name);
+console.log("Total Spent:", customer.getTotalSpent());
+console.log(
+  "Outstanding Balance:",
+  customer.getOutstandingBalance()
+);
+
+
+console.log("\n========================================");
+console.log("         FINAL TEST REPORT");
+console.log("========================================");
+
+
+console.log("Total Tests:", passed + failed);
+console.log("Passed:", passed);
+console.log("Failed:", failed);
+
+
+if (failed === 0) {
+  console.log("\nALL TESTS PASSED SUCCESSFULLY!");
+} else {
+  console.log("\nSOME TESTS FAILED. PLEASE CHECK THE ERRORS.");
+  process.exitCode = 1;
+}
